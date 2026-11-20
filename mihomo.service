@@ -1,0 +1,363 @@
+#!/system/bin/sh
+# Unofficial Mihomo (Clash Meta) TProxy service helper for compatible ZTE UFI Tools environments.
+# Review interface names and firewall rules before use.
+ROOT=${ROOT:-/data/mihomo}
+BIN=$ROOT/bin/mihomo
+CONFIG_DIR=$ROOT/config
+CONFIG=$CONFIG_DIR/config.yaml
+SUB_CONFIG=$CONFIG_DIR/subscriptions.json
+SUB_SCRIPT=$ROOT/scripts/update-sub.sh
+PIDFILE=$ROOT/run/mihomo.pid
+SUB_PIDFILE=$ROOT/run/mihomo-sub.pid
+LOG=${LOG:-$ROOT/logs/mihomo.log}
+SUB_LOG=${SUB_LOG:-$ROOT/logs/sub.log}
+LAN_IF=${LAN_IF:-br0}
+TPROXY_PORT=${TPROXY_PORT:-7893}
+DNS_PORT=${DNS_PORT:-1053}
+DASHBOARD_PORT=${DASHBOARD_PORT:-9090}
+MIXED_PORT=${MIXED_PORT:-7890}
+FWMARK=${FWMARK:-0x2024}
+ROUTE_TABLE=${ROUTE_TABLE:-2024}
+START_WAIT=${MIHOMO_START_WAIT:-2}
+LOG_MAX_BYTES=${LOG_MAX_BYTES:-2097152}
+LOG_KEEP_LINES=${LOG_KEEP_LINES:-1000}
+BLOCK_QUIC=${MIHOMO_BLOCK_QUIC:-1}
+ENABLE_IPV6=${MIHOMO_IPV6:-1}
+GO_MAXPROCS=${MIHOMO_GOMAXPROCS:-2}
+GO_MEMLIMIT=${MIHOMO_GOMEMLIMIT:-128MiB}
+GO_GC=${MIHOMO_GOGC:-50}
+CPU_MASK=${MIHOMO_CPU_MASK:-auto}
+
+trim_log() {
+  F="$1"
+  if ! test -f "$F"; then return 0; fi
+  SZ=$(wc -c < "$F" 2>/dev/null | tr -d ' \n' || echo 0)
+  case "$SZ" in ''|*[!0-9]*) SZ=0 ;; esac
+  if test "$SZ" -gt "$LOG_MAX_BYTES"; then
+    tail -n "$LOG_KEEP_LINES" "$F" > "$F.tmp" 2>/dev/null && cat "$F.tmp" > "$F" 2>/dev/null || : > "$F"
+    rm -f "$F.tmp"
+  fi
+}
+
+resolve_pid() {
+  PF="$1"
+  PATTERN="$2"
+  PID=$(cat "$PF" 2>/dev/null)
+  if test -z "$PID" || ! kill -0 "$PID" 2>/dev/null; then
+    PID=$(pgrep -f "$PATTERN" 2>/dev/null | head -n 1)
+  fi
+  if test -n "$PID" && kill -0 "$PID" 2>/dev/null; then
+    printf '%s' "$PID"
+    return 0
+  fi
+  return 1
+}
+
+is_auto_update_enabled() {
+  test -f "$SUB_CONFIG" && grep -Eq '"autoUpdate"[[:space:]]*:[[:space:]]*true' "$SUB_CONFIG" 2>/dev/null
+}
+
+start_sub_scheduler() {
+  mkdir -p "$ROOT/run" "$ROOT/logs"
+  if ! test -x "$SUB_SCRIPT"; then return 0; fi
+  if ! is_auto_update_enabled; then
+    stop_sub_scheduler >/dev/null 2>&1 || true
+    return 0
+  fi
+  SPID=$(resolve_pid "$SUB_PIDFILE" "$SUB_SCRIPT daemon" || true)
+  if test -n "$SPID"; then
+    echo "$SPID" > "$SUB_PIDFILE"
+    echo '定时订阅更新已在运行'
+    return 0
+  fi
+  nohup sh "$SUB_SCRIPT" daemon >> "$SUB_LOG" 2>&1 &
+  echo "$!" > "$SUB_PIDFILE"
+  echo '定时订阅更新已启动'
+}
+
+stop_sub_scheduler() {
+  SPID=$(resolve_pid "$SUB_PIDFILE" "$SUB_SCRIPT daemon" || true)
+  if test -n "$SPID"; then
+    kill "$SPID" 2>/dev/null || true
+    sleep 1
+    kill -9 "$SPID" 2>/dev/null || true
+  fi
+  rm -f "$SUB_PIDFILE"
+  echo '定时订阅更新已停止'
+}
+
+cleanup_tproxy() {
+  iptables -w 10 -t mangle -D PREROUTING -i "$LAN_IF" -m socket --transparent -j MIHOMO_DIVERT 2>/dev/null || true
+  iptables -w 10 -t mangle -F MIHOMO_DIVERT 2>/dev/null || true
+  iptables -w 10 -t mangle -X MIHOMO_DIVERT 2>/dev/null || true
+  iptables -w 10 -t mangle -D PREROUTING -i "$LAN_IF" -j MIHOMO 2>/dev/null || true
+  iptables -w 10 -t mangle -F MIHOMO 2>/dev/null || true
+  iptables -w 10 -t mangle -X MIHOMO 2>/dev/null || true
+  iptables -w 10 -t nat -D PREROUTING -i "$LAN_IF" -j MIHOMO_DNS 2>/dev/null || true
+  iptables -w 10 -t nat -F MIHOMO_DNS 2>/dev/null || true
+  iptables -w 10 -t nat -X MIHOMO_DNS 2>/dev/null || true
+  iptables -w 10 -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j REJECT 2>/dev/null || true
+  iptables -w 10 -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null || true
+  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$DASHBOARD_PORT" -j ACCEPT 2>/dev/null || true
+  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$MIXED_PORT" -j ACCEPT 2>/dev/null || true
+  iptables -w 10 -D INPUT -i "$LAN_IF" -p tcp --dport "$DNS_PORT" -j ACCEPT 2>/dev/null || true
+  iptables -w 10 -D INPUT -i "$LAN_IF" -p udp --dport "$DNS_PORT" -j ACCEPT 2>/dev/null || true
+  while ip rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
+  ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -w 10 -t mangle -D PREROUTING -i "$LAN_IF" -m socket --transparent -j MIHOMO6_DIVERT 2>/dev/null || true
+    ip6tables -w 10 -t mangle -F MIHOMO6_DIVERT 2>/dev/null || true
+    ip6tables -w 10 -t mangle -X MIHOMO6_DIVERT 2>/dev/null || true
+    ip6tables -w 10 -t mangle -D PREROUTING -i "$LAN_IF" -j MIHOMO6 2>/dev/null || true
+    ip6tables -w 10 -t mangle -F MIHOMO6 2>/dev/null || true
+    ip6tables -w 10 -t mangle -X MIHOMO6 2>/dev/null || true
+    ip6tables -w 10 -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j REJECT 2>/dev/null || true
+    ip6tables -w 10 -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null || true
+  fi
+  while ip -6 rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
+  ip -6 route flush table "$ROUTE_TABLE" 2>/dev/null || true
+}
+
+setup_tproxy_ipv6() {
+  if test "$ENABLE_IPV6" != "1"; then return 0; fi
+  if ! command -v ip6tables >/dev/null 2>&1; then return 0; fi
+
+  if ! ip -6 rule add fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null \
+    || ! ip -6 route add local ::/0 dev lo table "$ROUTE_TABLE" 2>/dev/null; then
+    while ip -6 rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
+    ip -6 route flush table "$ROUTE_TABLE" 2>/dev/null || true
+    return 0
+  fi
+
+  FAKE_IP6_RANGE=""
+  if test -f "$CONFIG"; then
+    FAKE_IP6_RANGE=$(sed -n "s/^[[:space:]]*fake-ip-range6:[[:space:]]*['\"]*\([^'\"#[:space:]]*\)['\"]*.*/\1/p" "$CONFIG" | head -n 1)
+  fi
+  if test -z "$FAKE_IP6_RANGE"; then
+    FAKE_IP6_RANGE="fc00::/18"
+  fi
+
+  if ! ip6tables -w 10 -t mangle -N MIHOMO6 2>/dev/null; then
+    return 0
+  fi
+  ip6tables -w 10 -t mangle -A MIHOMO6 -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null || true
+  for subnet6 in \
+    ::/128 ::1/128 ::ffff:0:0/96 2001:db8::/32 fe80::/10 ff00::/8
+  do
+    ip6tables -w 10 -t mangle -A MIHOMO6 -d "$subnet6" -j RETURN 2>/dev/null || true
+  done
+  ip6tables -w 10 -t mangle -A MIHOMO6 -p udp --dport 123 -j RETURN 2>/dev/null || true
+  if test "$BLOCK_QUIC" = "1"; then
+    ip6tables -w 10 -t mangle -A MIHOMO6 -p udp --dport 443 -j RETURN 2>/dev/null || true
+  fi
+  # Route IPv6 fake-ip range to TPROXY before bypassing remaining ULA (fc00::/7)
+  if test -n "$FAKE_IP6_RANGE"; then
+    ip6tables -w 10 -t mangle -A MIHOMO6 -d "$FAKE_IP6_RANGE" -p tcp -j TPROXY \
+      --on-ip ::1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null || true
+    ip6tables -w 10 -t mangle -A MIHOMO6 -d "$FAKE_IP6_RANGE" -p udp -j TPROXY \
+      --on-ip ::1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null || true
+  fi
+  ip6tables -w 10 -t mangle -A MIHOMO6 -d fc00::/7 -j RETURN 2>/dev/null || true
+  if ! ip6tables -w 10 -t mangle -A MIHOMO6 -p tcp -j TPROXY \
+      --on-ip ::1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null \
+    || ! ip6tables -w 10 -t mangle -A MIHOMO6 -p udp -j TPROXY \
+      --on-ip ::1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null \
+    || ! ip6tables -w 10 -t mangle -I PREROUTING 1 -i "$LAN_IF" -j MIHOMO6 2>/dev/null; then
+    ip6tables -w 10 -t mangle -D PREROUTING -i "$LAN_IF" -j MIHOMO6 2>/dev/null || true
+    ip6tables -w 10 -t mangle -F MIHOMO6 2>/dev/null || true
+    ip6tables -w 10 -t mangle -X MIHOMO6 2>/dev/null || true
+    while ip -6 rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
+    ip -6 route flush table "$ROUTE_TABLE" 2>/dev/null || true
+    return 0
+  fi
+
+  if ip6tables -w 10 -t mangle -N MIHOMO6_DIVERT 2>/dev/null; then
+    if ip6tables -w 10 -t mangle -A MIHOMO6_DIVERT -j MARK --set-mark "$FWMARK" 2>/dev/null \
+      && ip6tables -w 10 -t mangle -A MIHOMO6_DIVERT -j ACCEPT 2>/dev/null \
+      && ip6tables -w 10 -t mangle -I PREROUTING 1 -i "$LAN_IF" -m socket --transparent -j MIHOMO6_DIVERT 2>/dev/null; then
+      :
+    else
+      ip6tables -w 10 -t mangle -F MIHOMO6_DIVERT 2>/dev/null || true
+      ip6tables -w 10 -t mangle -X MIHOMO6_DIVERT 2>/dev/null || true
+    fi
+  fi
+
+  if test "$BLOCK_QUIC" = "1"; then
+    ip6tables -w 10 -I FORWARD 1 -i "$LAN_IF" -p udp --dport 443 -j REJECT 2>/dev/null \
+      || ip6tables -w 10 -I FORWARD 1 -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null || true
+  fi
+}
+
+setup_tproxy() {
+  cleanup_tproxy
+  ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE" || return 1
+  ip route add local 0.0.0.0/0 dev lo table "$ROUTE_TABLE" || return 1
+
+  iptables -w 10 -t mangle -N MIHOMO || return 1
+  iptables -w 10 -t mangle -A MIHOMO -p tcp --dport 53 -j RETURN || return 1
+  iptables -w 10 -t mangle -A MIHOMO -p udp --dport 53 -j RETURN || return 1
+  for subnet in \
+    0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
+    169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 \
+    192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 \
+    224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
+  do
+    iptables -w 10 -t mangle -A MIHOMO -d "$subnet" -j RETURN || return 1
+  done
+  iptables -w 10 -t mangle -A MIHOMO -p udp --dport 123 -j RETURN || return 1
+  if test "$BLOCK_QUIC" = "1"; then
+    iptables -w 10 -t mangle -A MIHOMO -p udp --dport 443 -j RETURN || return 1
+  fi
+  iptables -w 10 -t mangle -A MIHOMO -p tcp -j TPROXY \
+    --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
+  iptables -w 10 -t mangle -A MIHOMO -p udp -j TPROXY \
+    --on-ip 127.0.0.1 --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" || return 1
+  iptables -w 10 -t mangle -I PREROUTING 1 -i "$LAN_IF" -j MIHOMO || return 1
+
+  # Fast-path established transparent sockets to skip per-packet MIHOMO chain traversal
+  if iptables -w 10 -t mangle -N MIHOMO_DIVERT 2>/dev/null; then
+    if iptables -w 10 -t mangle -A MIHOMO_DIVERT -j MARK --set-mark "$FWMARK" 2>/dev/null \
+      && iptables -w 10 -t mangle -A MIHOMO_DIVERT -j ACCEPT 2>/dev/null \
+      && iptables -w 10 -t mangle -I PREROUTING 1 -i "$LAN_IF" -m socket --transparent -j MIHOMO_DIVERT 2>/dev/null; then
+      :
+    else
+      iptables -w 10 -t mangle -F MIHOMO_DIVERT 2>/dev/null || true
+      iptables -w 10 -t mangle -X MIHOMO_DIVERT 2>/dev/null || true
+    fi
+  fi
+
+  if test "$BLOCK_QUIC" = "1"; then
+    iptables -w 10 -I FORWARD 1 -i "$LAN_IF" -p udp --dport 443 -j REJECT 2>/dev/null \
+      || iptables -w 10 -I FORWARD 1 -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null || true
+  fi
+
+  iptables -w 10 -t nat -N MIHOMO_DNS || return 1
+  iptables -w 10 -t nat -A MIHOMO_DNS -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+  iptables -w 10 -t nat -A MIHOMO_DNS -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+  iptables -w 10 -t nat -I PREROUTING 1 -i "$LAN_IF" -j MIHOMO_DNS || return 1
+
+  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$DASHBOARD_PORT" -j ACCEPT || return 1
+  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$MIXED_PORT" -j ACCEPT || return 1
+  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p tcp --dport "$DNS_PORT" -j ACCEPT || return 1
+  iptables -w 10 -I INPUT 1 -i "$LAN_IF" -p udp --dport "$DNS_PORT" -j ACCEPT || return 1
+
+  setup_tproxy_ipv6 || true
+}
+
+resolve_cpu_mask() {
+  case "$CPU_MASK" in
+    ''|off|none|0) return 0 ;;
+    auto) ;;
+    *) printf '%s' "$CPU_MASK"; return 0 ;;
+  esac
+  # Auto-detect little/efficiency cores on heterogeneous (big.LITTLE) SoCs only.
+  # On homogeneous SoCs (all cores share the same max_freq), do not pin.
+  awk '
+    BEGIN { min_f = 0; max_f = 0; count = 0 }
+    {
+      idx = FILENAME
+      sub(/\/cpufreq\/cpuinfo_max_freq$/, "", idx)
+      sub(/^.*\/cpu/, "", idx)
+      f = $1 + 0
+      if (idx ~ /^[0-9]+$/ && f > 0) {
+        freq[idx] = f
+        if (min_f == 0 || f < min_f) min_f = f
+        if (f > max_f) max_f = f
+        count++
+      }
+    }
+    END {
+      if (count < 2 || min_f <= 0 || max_f <= min_f) exit 0
+      mask = 0
+      for (i in freq) {
+        if (freq[i] == min_f && (i + 0) < 31) {
+          bit = 1
+          for (k = 0; k < (i + 0); k++) bit *= 2
+          mask += bit
+        }
+      }
+      if (mask > 0) printf "%x", mask
+    }
+  ' /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq 2>/dev/null
+}
+
+start_service() {
+  mkdir -p "$ROOT/run" "$CONFIG_DIR" "$ROOT/logs"
+  echo '[1/4] 检查日志与运行状态'
+  trim_log "$LOG"
+  trim_log "$SUB_LOG"
+  PID=$(resolve_pid "$PIDFILE" "$BIN -d $CONFIG_DIR -f $CONFIG" || true)
+  if test -n "$PID"; then
+    echo "$PID" > "$PIDFILE"
+    echo "[3/4] 检测到进程 (PID=$PID) 已在运行，刷新 TProxy 规则..."
+    setup_tproxy || { echo 'TProxy 规则安装失败'; return 1; }
+    start_sub_scheduler || true
+    echo '[4/4] mihomo 已在运行，TProxy 规则已刷新'
+    return 0
+  fi
+  echo '[2/4] 校验配置并启动 mihomo 进程...'
+  "$BIN" -t -d "$CONFIG_DIR" -f "$CONFIG" || return 1
+  EFF_MASK=$(resolve_cpu_mask || true)
+  if test -n "$EFF_MASK" && command -v taskset >/dev/null 2>&1; then
+    GOMAXPROCS="$GO_MAXPROCS" GOMEMLIMIT="$GO_MEMLIMIT" GOGC="$GO_GC" \
+      nohup taskset "$EFF_MASK" "$BIN" -d "$CONFIG_DIR" -f "$CONFIG" >> "$LOG" 2>&1 &
+  else
+    GOMAXPROCS="$GO_MAXPROCS" GOMEMLIMIT="$GO_MEMLIMIT" GOGC="$GO_GC" \
+      nohup "$BIN" -d "$CONFIG_DIR" -f "$CONFIG" >> "$LOG" 2>&1 &
+  fi
+  PID=$!
+  echo "$PID" > "$PIDFILE"
+  sleep "$START_WAIT"
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo '启动失败，请查看内核日志'
+    rm -f "$PIDFILE"
+    return 1
+  fi
+  echo "[3/4] 进程已启动 (PID=$PID)，正在安装 TProxy 与 DNS 规则..."
+  if ! setup_tproxy; then
+    echo 'TProxy 规则安装失败，已回滚'
+    cleanup_tproxy
+    kill "$PID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    return 1
+  fi
+  start_sub_scheduler || true
+  echo '[4/4] mihomo TProxy 启动成功'
+}
+
+stop_service() {
+  if test "${KEEP_SCHEDULER:-0}" != "1"; then
+    echo '[1/3] 停止定时订阅守护进程...'
+    stop_sub_scheduler || true
+  fi
+  echo '[2/3] 清理 TProxy 与 DNS 防火墙/路由规则...'
+  cleanup_tproxy
+  echo '[3/3] 停止 mihomo 进程...'
+  PID=$(resolve_pid "$PIDFILE" "$BIN -d $CONFIG_DIR -f $CONFIG" || true)
+  if test -z "$PID"; then
+    echo 'mihomo 未运行，TProxy 规则已清理'
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  kill "$PID" 2>/dev/null || true
+  COUNT=0
+  while kill -0 "$PID" 2>/dev/null && test "$COUNT" -lt 10; do
+    sleep 1
+    COUNT=$((COUNT + 1))
+  done
+  kill -9 "$PID" 2>/dev/null || true
+  rm -f "$PIDFILE"
+  echo 'mihomo 已停止，TProxy 规则已清理'
+}
+
+case "$1" in
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) KEEP_SCHEDULER=1 stop_service; start_service ;;
+  status) resolve_pid "$PIDFILE" "$BIN -d $CONFIG_DIR -f $CONFIG" >/dev/null ;;
+  sub-start) start_sub_scheduler ;;
+  sub-stop) stop_sub_scheduler ;;
+  sub-status) resolve_pid "$SUB_PIDFILE" "$SUB_SCRIPT daemon" >/dev/null ;;
+  *) echo '用法: mihomo.service {start|stop|restart|status|sub-start|sub-stop|sub-status}'; exit 1 ;;
+esac

@@ -1,0 +1,20 @@
+# macOS / OS
+.DS_Store
+Thumbs.db
+
+# Runtime / Logs / Temp
+*.log
+*.tmp
+*.bak
+*.pid
+
+# Local sensitive configs
+config.yaml
+subscriptions.json
+install.json
+sub_status.json
+
+# Node / Editor
+node_modules/
+.vscode/
+.idea/
